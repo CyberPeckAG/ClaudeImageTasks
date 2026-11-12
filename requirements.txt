@@ -1,0 +1,5 @@
+Pillow>=10
+numpy
+# AI upscaling (optional; without these the script falls back to Lanczos)
+torch
+spandrel
