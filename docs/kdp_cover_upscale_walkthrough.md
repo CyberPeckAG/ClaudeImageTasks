@@ -1,189 +1,301 @@
-# Walkthrough: `kdp_cover_upscale.py`
+# From a Small Picture to a Print-Ready Cover
 
-Notes for explaining the script: what it does, how it is put together, and why
-each choice was made. Line numbers refer to `kdp_cover_upscale.py` (439 lines).
+*A worked example in Python, written for anyone who wants to build something
+similar themselves.*
 
-## 1. The problem in one paragraph
+---
 
-AI-generated cover art usually comes out around 1024-1254 px square. Amazon KDP
-needs a print cover at 300 DPI with 0.125 in of bleed. For an 8.5 x 8.5 in book
-that is 2588 x 2625 px, so the art has to be enlarged about 2.5x. A plain resize
-only makes the pixels bigger, so the result looks soft. This script uses an AI
-super-resolution model (Real-ESRGAN) to redraw edges and fine detail at the
-higher resolution. It also does the KDP geometry (trim, bleed, spine width) and
-writes files KDP will accept.
+## Where we're starting
 
-```bash
-python kdp_cover_upscale.py dragons.png --target print-front --trim 8.5x8.5 --sharpen 30
+Here's the situation that led to this script. You've made some cover art for a
+book. Perhaps you drew it, perhaps you generated it, and either way it looks great
+on screen. You go to upload it to Amazon KDP for a printed paperback, and KDP
+rejects it, because the image is too small.
+
+The art is 1024 pixels square. KDP wants 300 dots per inch. For an 8.5-inch-square
+book, after a few adjustments we'll come to shortly, that means 2588 by 2625
+pixels. We need to make the picture about two and a half times bigger *and* keep
+it sharp.
+
+That second part is the real problem. Making an image bigger is easy. Making it
+bigger without it turning soft and blurry is not.
+
+I'm going to walk you through how I approached this, in roughly the order I'd
+want you to think about it. The finished script is `kdp_cover_upscale.py` in this
+repository, but please don't start by reading all 400-odd lines of it. Build up
+to it with me.
+
+---
+
+## Step 1: Try the obvious thing first
+
+Whenever you meet a new problem, try the simplest possible solution and look
+closely at how it fails. The failure tells you what the real problem is.
+
+The simplest solution here is to resize the image with Pillow:
+
+```python
+from PIL import Image
+
+img = Image.open("cover.png").convert("RGB")
+big = img.resize((2588, 2625), Image.LANCZOS)
+big.save("cover_big.png", dpi=(300, 300))
 ```
 
-## 2. The pipeline
+Run that, open the result, and zoom in on the title lettering. It's the right
+size, but the edges are fuzzy. Fine lines have turned into soft grey smudges.
+
+Why? A resize can only *interpolate*. Each new pixel is a weighted average of the
+original pixels near it. There's no new information, just the old information
+spread more thinly. Lanczos is about the best interpolation filter you can get,
+and it still can't add detail that was never there.
+
+Keep that result. It's the baseline everything else gets compared against.
+
+> **Try this:** resize the same image with `Image.NEAREST`, `Image.BILINEAR` and
+> `Image.LANCZOS`, and put crops of each side by side. You'll see the trade-offs
+> between blocky, soft and slightly-less-soft for yourself.
+
+---
+
+## Step 2: Understand what "correct" means before improving anything
+
+Before reaching for anything clever, I made sure I knew exactly what the output
+needed to be. It's tempting to skip this, and it's the step that saves the most time.
+
+KDP's print rules, in plain terms:
+
+- **300 DPI.** The pixel count must be the inches multiplied by 300.
+- **Bleed.** Printers can't cut paper perfectly, so the artwork has to extend
+  0.125 inches past the edge where the page is trimmed. That stops a thin white
+  sliver appearing if the cut lands a fraction off.
+- **The spine edge doesn't need bleed** on a front cover, because that edge folds
+  around the spine rather than being cut.
+- **A full paperback cover is one wide image:** back cover, spine and front cover
+  side by side. The spine's width depends on how many pages the book has and how
+  thick the paper is.
+
+So for an 8.5 × 8.5 inch book's front cover:
 
 ```
-load_rgb ──> fit_to_aspect ──> upscale ──> (sharpen) ──> (assemble wrap) ──> save_outputs ──> report
- colour        crop / pad       AI or        optional       back + spine       JPEG / PDF        checks and
- + rotation    to target ratio  Lanczos      unsharp mask   + front            + PNG             warnings
+width  = (8.5 + 0.125)     × 300 = 2587.5  →  2588 px   (one bleed edge)
+height = (8.5 + 0.125 × 2) × 300 = 2625    →  2625 px   (top and bottom bleed)
 ```
 
-`main()` (line 369) reads top to bottom in exactly this order, which makes it the
-best place to start a walkthrough.
+Notice that I rounded 2587.5 *up*. If we're half a pixel short, we're below the
+minimum, so we always round up. In the script, that's this small function:
 
-## 3. Section by section
+```python
+def px(inches: float, dpi: int) -> int:
+    return math.ceil(inches * dpi - 1e-9)
+```
 
-### Constants (lines 35-67): the KDP rules in one place
+The `- 1e-9` looks odd, so it's worth a word. Floating-point maths sometimes gives
+`2550.0000000001` when the true answer is exactly 2550, and `ceil` would then bump
+it to 2551. Subtracting a tiny amount guards against that. It's a small thing, but
+it's the kind of small thing you only learn about by getting bitten by it.
 
-`EBOOK_SIZE`, `BLEED_IN`, `SPINE_PER_PAGE`, the file-size limits and the model
-URLs are all module-level constants.
+In the script, all of this lives in `build_spec()`. It takes the user's choices
+(trim size, page count, paper type) and returns the exact pixel dimensions
+*before any image is touched*. I'd encourage you to keep that separation in your
+own work: get the arithmetic right and testable on its own, then worry about pixels.
 
-**Why:** the business rules come from KDP's documentation and could change. Keeping
-them together and named means there are no magic numbers in the logic, and an
-update is a one-line edit.
+---
 
-### `Spec` dataclass and `build_spec()` (lines 71-133): geometry first
+## Step 3: Find a tool that adds real detail
 
-`build_spec()` turns the command-line options into a `Spec`: the output width and
-height in pixels, the DPI, and, for wraps, where the front panel and spine sit.
+This is the heart of it. If interpolation can't add detail, what can?
 
-- **Front cover:** trim width + 1 bleed (the spine edge gets none) by trim height + 2 bleeds.
-- **Full wrap:** `2 × (trim + bleed) + spine`, where spine = pages × paper thickness.
-- `px()` (line 94) rounds *up* (`math.ceil`) so the output is never a fraction of
-  a pixel short of the minimum. The `- 1e-9` stops a float like `2550.0000001`
-  being rounded up to 2551.
+The answer is **super-resolution**: neural networks trained on millions of pairs
+of low- and high-resolution images. They learn what a sharp edge, a line of text
+or a scaly texture *usually* looks like at higher resolution, and they predict that
+detail. One of the best-known free models is **Real-ESRGAN**, which enlarges by 4×.
 
-**Why:** working out the target size before touching any pixels keeps the
-measurement logic separate from the image processing. It is also easy to test,
-and a bad option (such as `--pages` missing for a wrap) fails before any slow work starts.
+You don't need to understand how the network works inside to use it, any more than
+you need to understand Lanczos's maths to call `resize`. You do need to know how
+to feed it an image and get one back. With the `spandrel` library, which reads
+these model files and builds the right network for you, the core looks like this:
 
-### `load_rgb()` (line 139): normalise the input
+```python
+import numpy as np
+import torch
+from spandrel import ModelLoader
 
-The function:
+model = ModelLoader().load_from_file("RealESRGAN_x4plus.pth").model.eval()
 
-1. Applies the EXIF orientation, so phone photos aren't sideways.
-2. Flattens transparency onto white. PNGs with alpha would otherwise turn black in JPEG.
-3. Converts from any embedded ICC colour profile to sRGB.
-4. Always returns 8-bit RGB.
+arr = np.asarray(img, dtype=np.float32) / 255.0               # pixels as 0..1
+t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)       # (1, 3, H, W)
+with torch.inference_mode():
+    out = model(t).clamp(0, 1)
+out = out[0].permute(1, 2, 0).numpy()                          # back to (H, W, 3)
+big = Image.fromarray((out * 255 + 0.5).astype(np.uint8))
+```
 
-**Why:** every later step can then assume one image format. Input mistakes such
-as transparency, CMYK and rotation are dealt with once, at the start.
+Take a moment over the middle lines, because they confuse almost everyone the first time.
 
-### `fit_to_aspect()` (line 165): different shapes
+- Pillow and NumPy store an image as height × width × colour, written `(H, W, 3)`.
+- PyTorch models expect colour *first*, and they process a *batch* of images at
+  once, so they want `(1, 3, H, W)`.
+- `permute(2, 0, 1)` reorders the axes, and `unsqueeze(0)` adds the batch dimension
+  of 1. On the way out, we undo both.
 
-The source is rarely the target's exact shape. There are three strategies:
+Once you understand that shape juggling, most image models stop being mysterious.
 
-- `crop` (the default): trims the overflow. `--gravity` chooses which part to keep.
-- `pad`: extends the canvas with a blurred, darkened copy of the art. This is the
-  usual "letterbox" fix and looks better than flat bars.
-- `stretch`: distorts the image. It's included for completeness and rarely wanted.
+Run this on a small image, then compare the result with your Step 1 baseline.
+On our book covers, the difference was obvious straight away. The lettering
+came back with crisp black outlines, and the line art looked inked rather than smudged.
 
-**Why:** the fit happens *before* upscaling, while the image is still small. That
-makes it cheaper, and the AI model then works only on pixels that will appear in the output.
+---
 
-### The upscaling engines (lines 197-303): the core
+## Step 4: Deal with the problem you'll hit next, which is memory
 
-**Optional dependency.** `ai_available()` tries to import `torch` and `spandrel`.
-If they're missing, `--engine auto` falls back to Lanczos instead of crashing, so
-the script still runs on a machine with only Pillow and NumPy installed.
+Run that code on a full 1254-pixel cover and, depending on your machine, it'll
+either take an age or run out of memory. The network creates a lot of
+intermediate data for every pixel, all at once.
 
-**`RealESRGAN` class.** The model is loaded with `spandrel`, which reads the
-weights file and builds the correct network. The class uses the GPU if one is
-present and switches to half precision there.
+The standard fix is **tiling**: cut the image into small squares, upscale each one,
+and stitch the results back together. In the script, the tiles are 192 pixels across.
 
-**Tiled inference (`upscale`, line 238).** This is the most interesting code to explain:
+If you try this naively, though, you'll see faint lines in a grid across the
+finished image. Neural networks behave a little strangely at the very edge of
+their input, where they can't "see" what lies beyond. Every tile has edges, so
+every tile has a slightly wrong border.
 
-- The image is processed in 192 px tiles, so memory stays flat for any input size.
-- Each tile is read with 16 px of extra context on every side. The whole image is
-  first mirror-padded (`np.pad(..., mode="reflect")`) so edge tiles have context too.
-- The model's output for that extra margin is thrown away. Only the centre of each
-  tile is written into the output array. This prevents visible seams: a network
-  behaves badly near the edge of its input, so you keep only the part it saw in full.
-- Pillow image → NumPy float array → PyTorch tensor (HWC → CHW plus a batch dimension)
-  → model → back again. That conversion chain is worth being able to describe.
+The fix I used is simple and worth remembering because it turns up in lots of
+image work:
 
-**`upscale()` wrapper (line 272).**
+1. Give each tile a margin of extra context, 16 pixels on every side, taken from
+   its neighbours.
+2. Upscale the tile with its margin.
+3. **Throw the upscaled margin away** and keep only the centre.
 
-- If the source is already big enough, it simply downsamples.
-- Real-ESRGAN is fixed at 4x, so the script oversamples and then reduces to the
-  exact size with Lanczos. Super-resolving and then shrinking gives a sharper
-  result than a smaller enlargement would.
-- It runs a second pass only when 4x isn't enough, with a limit of two passes.
-- `--strength` blends the AI result with a plain resize. That's a simple way to
-  tone it down if the model invents too much detail.
+The network sees enough surrounding detail that the part we keep is accurate.
+For tiles at the outer edge of the picture, where there's no neighbour, I pad the
+whole image with a mirror reflection first (`np.pad(..., mode="reflect")`) so even
+those tiles have something sensible beyond their edge.
 
-**`lanczos_upscale()` (line 262).** The fallback enlarges in steps of at most 2x,
-with light sharpening after each step. That keeps edges cleaner than one large jump.
+The `RealESRGAN.upscale` method in the script is this idea and nothing more. Read
+it with this explanation beside you and the slicing arithmetic should make sense.
 
-### Saving and reporting (lines 309-366)
+---
 
-- **eBook:** JPEG at quality 95 with no chroma subsampling, so colour edges such
-  as red text stay crisp. If the file goes over KDP's limit, the quality is
-  lowered in steps.
-- **Print:** a PDF (the file KDP actually takes) plus a lossless PNG master. Both
-  carry 300 DPI metadata.
-- **`report()`:** prints the sizes, the enlargement factor and the method used.
-  It warns about KDP rules a script can't enforce, such as the barcode area and
-  the minimum page count for spine text.
+## Step 5: Hit the exact size
 
-**Why report and not silently succeed?** For print work, a person must check the
-result. The report tells them exactly what to look at.
+Real-ESRGAN always enlarges by exactly 4×. We need about 2.5×. What do we do?
 
-### `main()` (line 369): the command-line interface
+We go past the target and come back. Upscale 4× to roughly 4100 pixels, then use
+an ordinary Lanczos resize to bring it *down* to 2588 × 2625. Shrinking an image
+is the one thing interpolation does really well, and starting from more detail
+than we need gives the sharpest result.
 
-The CLI uses `argparse` with `choices=` to validate options, a custom type
-function (`parse_trim`) that converts and validates "6x9" in one step, and the
-module docstring as the `--help` text. `main(argv=None)` returns an exit code and
-is called through `sys.exit(main())`. That pattern means the function can also be
-called from tests with a list of arguments.
+The script's `upscale()` function also handles the other cases:
 
-## 4. Python features on show
+- If the image is already big enough, it just shrinks it.
+- If 4× isn't enough, it runs a second pass.
+- If the AI libraries aren't installed, it falls back to Lanczos with a little
+  sharpening, so the script still does *something* useful on any machine.
 
-| Feature | Where |
-| --- | --- |
-| `@dataclass` | `Spec`, line 71 |
-| Type hints, including `X \| None` and `tuple[...]` | throughout |
-| `pathlib.Path` instead of string paths | throughout |
-| Walrus operator `:=` | download loop, line 207 |
-| Optional imports and graceful fallback | `ai_available()`, line 212 |
-| Context managers | `urllib` download, `torch.inference_mode()` |
-| NumPy slicing and padding | tiled inference, line 238 |
-| `argparse` with custom types and choices | `parse_trim`, `main()` |
-| Atomic file write (`.part` then rename) | `download_model()`, line 197 |
+That last point is good practice in general. Treat heavy dependencies like PyTorch
+as optional extras, and degrade gracefully when they're missing.
 
-## 5. Honest weaknesses and what I'd improve
+---
 
-Being able to criticise the code is usually worth as much as explaining it.
+## Step 6: The unglamorous parts that make it actually work
 
-1. **No automated tests.** `build_spec()` and `px()` are pure functions and the
-   obvious first candidates for `pytest`, for example checking that 8.5 x 8.5 in
-   gives 2588 x 2625 px.
-2. **Downloaded model weights aren't checksum-verified.** A SHA-256 check against a
-   known hash would guard against corrupt or tampered files. The weights are a
-   PyTorch pickle, so this matters.
-3. **`assert` is used for input validation** in the `--gravity` parsing. Asserts
-   are removed when Python runs with `-O`, so it should raise a normal error instead.
-4. **Tiles are hard-cut, not blended.** The context margin hides seams well in
-   practice. Feathered blending of overlapping tiles would be more robust on
-   smooth gradients.
-5. **CPU speed:** about four minutes for a 1254 px source with the large model.
-   The `general` model is several times faster, and a GPU is used automatically when present.
-6. **`args` is passed around** to `upscale()`, `save_outputs()` and `report()`.
-   Passing only the values each function needs would make them easier to test on
-   their own.
-7. **One real bug was found and fixed during testing.** An output name like
-   `flight_front_8.5x8.5` was cut down to `flight_front_8` because
-   `Path.with_suffix()` treated `.5x8` as a file extension. The fix only strips
-   real image extensions. It's a good example of why a test run with realistic inputs matters.
+At this point you have the clever bit working, and it's tempting to stop. Most of
+the remaining lines of the script handle the things that go wrong with real
+files. I want to persuade you these matter just as much.
 
-## 6. Likely questions
+**Images arrive in all sorts of states.** `load_rgb()` deals with them up front:
 
-- **"Why not just resize?"** Resizing only interpolates between existing pixels, so
-  edges get softer. Super-resolution is trained to predict the detail a
-  higher-resolution version would have. The side-by-side comparison crops show the
-  difference clearly.
-- **"Is the AI inventing detail?"** Somewhat, yes. Hence `--strength`, and the
-  advice to check text and faces at 100% zoom. Line art and lettering come out
-  well. Very fine textures can come out slightly "painted".
-- **"Why 300 DPI and 0.125 in bleed?"** Both are KDP print requirements. The bleed
-  lets the printer trim without leaving white slivers at the edges.
-- **"How does it handle huge images?"** Tiling keeps the model's memory use flat.
-  `Image.MAX_IMAGE_PIXELS` is raised because full print wraps exceed Pillow's
-  default safety limit.
+- photos rotated by phone EXIF data
+- PNGs with transparency, which turns black if you save it as JPEG
+- images in unusual colour profiles
+
+It always hands back plain RGB, so nothing further down has to worry.
+
+**The picture isn't always the right shape.** A square image going onto a tall
+eBook cover has to be cropped or padded. `fit_to_aspect()` offers both. Its
+padding option fills the gaps with a blurred, darkened copy of the art, which
+looks far better than plain bars. I do this *before* upscaling, while the image
+is small, so we don't spend minutes enhancing pixels we'll then crop away.
+
+**Save in the format KDP actually wants:**
+
+- **For print:** a PDF, plus a PNG master copy.
+- **For eBooks:** a high-quality JPEG with chroma subsampling turned off, so red
+  and blue lettering keeps crisp edges.
+
+**Tell the user what happened.** The script ends by printing:
+
+- the sizes, how far the image was enlarged, and which method was used
+- reminders about KDP rules a program can't check, like keeping text away from
+  the edges and leaving room for the barcode.
+
+For anything going to print, a person should always have the final look. The
+report tells them where to look.
+
+---
+
+## Step 7: Check your work properly
+
+Don't trust your eyes on the full image. Everything looks fine when shrunk to fit
+a screen.
+
+What I did instead was cut the same small region (the title, a detailed bit of
+line art, a busy colourful area) from both the original and the result, scale the
+original crop up to match, and place them side by side. That makes the difference,
+and any problems, impossible to miss.
+
+That check caught some things worth knowing:
+
+- Thin lines come out slightly bolder than the original.
+- Very fine textures can look a little "painted".
+- The final sharpening step left a faint pale halo around some of the lettering.
+
+None of these ruled the result out. You can only make that judgement once you've
+actually looked.
+
+Testing also turned up a real bug. I named an output file `flight_front_8.5x8.5`,
+and the script saved it as `flight_front_8`. Python's `Path.with_suffix()` had
+decided that `.5x8` was a file extension and replaced it. It's a perfectly ordinary
+filename, and it would never have occurred to me to test it on purpose. Run your
+code on realistic inputs, not just tidy ones.
+
+---
+
+## What I'd do differently
+
+No script is finished. If you build your own version, here's where I'd improve on mine:
+
+- **Write tests for the arithmetic.** `build_spec()` and `px()` take numbers and
+  return numbers, so they're perfect for a few `pytest` checks. For example: does
+  8.5 × 8.5 really give 2588 × 2625?
+- **Verify the downloaded model file.** The script fetches the model weights from
+  the internet and loads them. Checking the file against a known SHA-256 hash
+  first would protect against a corrupted or tampered download.
+- **Don't use `assert` to check user input.** Python skips `assert` statements
+  when run with the `-O` flag. Raise a proper error instead.
+- **Blend the tiles rather than cutting them.** The margin trick works well, but
+  fading overlapping tiles into each other would be safer on smooth gradients like skies.
+- **Pass functions only what they need.** Several functions receive the whole
+  `args` object from `argparse`, which makes them harder to test on their own.
+
+---
+
+## Your turn
+
+If you want to build something similar, here's the order I'd suggest:
+
+1. Do the naive resize. Save it, and keep it as your baseline.
+2. Work out your target dimensions on paper, then in a function, then test that function.
+3. Get one AI model working on a small image. Don't add anything else yet.
+4. Add tiling once you hit memory limits, and then fix the seams.
+5. Only then add the handling for awkward files, the different shapes and the report.
+6. At every stage, compare crops side by side.
+
+You'll end up with something that looks a lot like this script. More importantly,
+you'll understand *why* each piece is there, because you'll have hit the problem
+it solves.
+
+Good luck, and zoom in on everything.
